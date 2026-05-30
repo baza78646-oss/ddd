@@ -3,10 +3,10 @@ import uuid
 import datetime
 import logging
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, CommandObject
+from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 import db
 from xui_api import XUIClient
@@ -46,15 +46,44 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     elif message.from_user.username:
         db.update_username(message.from_user.id, message.from_user.username)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 Купить подписку", callback_data="buy_sub")],
+    reply_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Меню")]],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+    inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Купить подписку", callback_data="buy_sub")],
+        [InlineKeyboardButton(text="👤 Мой аккаунт", callback_data="my_account")],
         [InlineKeyboardButton(text="❤️ Пригласить друзей", callback_data="invite_friends")],
         [InlineKeyboardButton(text="🎁 Подарить подписку", callback_data="gift_sub")],
         [InlineKeyboardButton(text="🆘 Помощь", callback_data="help_btn")]
     ])
+
     await message.answer(
         "Добро пожаловать! Выберите действие:",
-        reply_markup=kb
+        reply_markup=reply_kb
+    )
+    await message.answer(
+        "Главное меню:",
+        reply_markup=inline_kb
+    )
+
+@dp.message(F.text == "Меню")
+async def process_menu_text(message: types.Message, state: FSMContext):
+    await state.clear()
+
+    inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Купить подписку", callback_data="buy_sub")],
+        [InlineKeyboardButton(text="👤 Мой аккаунт", callback_data="my_account")],
+        [InlineKeyboardButton(text="❤️ Пригласить друзей", callback_data="invite_friends")],
+        [InlineKeyboardButton(text="🎁 Подарить подписку", callback_data="gift_sub")],
+        [InlineKeyboardButton(text="🆘 Помощь", callback_data="help_btn")]
+    ])
+
+    await message.answer(
+        "Главное меню:",
+        reply_markup=inline_kb
     )
 
 @dp.callback_query(F.data == "buy_sub")
@@ -86,11 +115,53 @@ async def process_invite_friends(callback_query: types.CallbackQuery, state: FSM
         parse_mode="Markdown"
     )
 
+@dp.callback_query(F.data == "my_account")
+async def process_my_account(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
+    await state.clear()
+    user = db.get_user(callback_query.from_user.id)
+
+    if not user:
+        await callback_query.message.answer("Информация о вашем аккаунте не найдена.")
+        return
+
+    now = datetime.datetime.now()
+    expires_at = user['expires_at']
+    if isinstance(expires_at, str):
+        try:
+            expires_at = datetime.datetime.fromisoformat(expires_at)
+        except ValueError:
+            # Fallback if needed, though db should contain valid iso format
+            expires_at = None
+
+    if expires_at and expires_at > now:
+        status = "✅ Активна"
+        expiry_str = expires_at.strftime("%d.%m.%Y %H:%M")
+    else:
+        status = "❌ Неактивна"
+        expiry_str = expires_at.strftime("%d.%m.%Y %H:%M") if expires_at else "Нет данных"
+
+    text = (
+        f"👤 **Ваш аккаунт**\n\n"
+        f"Статус подписки: {status}\n"
+        f"Действует до: {expiry_str}"
+    )
+
+    await callback_query.message.answer(text, parse_mode="Markdown")
+
 @dp.callback_query(F.data == "help_btn")
 async def process_help_btn(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
     await state.clear()
-    await callback_query.message.answer(
+    await _send_help(callback_query.message)
+
+@dp.message(Command("help"))
+async def process_help_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    await _send_help(message)
+
+async def _send_help(message: types.Message):
+    await message.answer(
         "🆘 **Помощь и инструкции**\n\n"
         "1. Скачайте приложение Hiddify (доступно в App Store и Google Play).\n"
         "2. Скопируйте ссылку, которую вам выдал бот после оплаты.\n"
