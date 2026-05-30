@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from aiogram.types import BotCommand
+
 from aggregator import start_aggregator
 from bot import dp, bot
 from db import init_db, get_expiring_users, set_notified_3_days
@@ -44,6 +46,11 @@ async def main():
 
     # Run expiration check in background
     asyncio.create_task(check_expirations())
+
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="help", description="Помощь")
+    ])
 
     await dp.start_polling(bot)
 
