@@ -2,7 +2,8 @@ import os
 import uuid
 import datetime
 import logging
-from aiogram import Bot, Dispatcher, F, types
+import asyncio
+from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -19,6 +20,25 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=os.environ.get("BOT_TOKEN", "1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789"))
 dp = Dispatcher()
+
+class BlockMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user_id = None
+        if isinstance(event, types.Message):
+            user_id = event.from_user.id
+        elif isinstance(event, types.CallbackQuery):
+            user_id = event.from_user.id
+
+        if user_id:
+            user = db.get_user(user_id)
+            if user and user['is_blocked'] == 1:
+                if isinstance(event, types.CallbackQuery):
+                    await event.answer("Вы заблокированы.", show_alert=True)
+                return
+        return await handler(event, data)
+
+dp.message.middleware(BlockMiddleware())
+dp.callback_query.middleware(BlockMiddleware())
 
 PLANS = {
     "trial": {"name": "3 дня (Пробный)", "days": 3, "price": 0},
@@ -305,6 +325,13 @@ async def process_check_payment(callback_query: types.CallbackQuery):
         if is_paid:
             target_id = pending['target_telegram_id'] if pending['target_telegram_id'] is not None else pending['telegram_id']
             await process_successful_subscription(callback_query.message, target_id, pending['plan_duration_days'])
+
+            # Record sale
+            for plan_id, plan_data in PLANS.items():
+                if plan_data['days'] == pending['plan_duration_days']:
+                    db.record_sale(pending['telegram_id'], plan_id, plan_data['price'])
+                    break
+
             if pending['target_telegram_id'] is not None:
                 try:
                     await bot.send_message(target_id, "Вам подарили подписку!")
@@ -430,3 +457,175 @@ async def process_successful_subscription(message: types.Message, user_id: int, 
                     await bot.send_message(referrer_id, "Ваш друг приобрел подписку! Вам начислено 10 дней бесплатно.")
                 except Exception as e:
                     logger.error(f"Failed to notify referrer: {e}")
+
+class AdminStates(StatesGroup):
+    waiting_for_user_query = State()
+    waiting_for_broadcast_msg = State()
+
+async def send_admin_panel(message: types.Message):
+    stats = db.get_stats()
+
+    top_plans_str = ""
+    for idx, (plan_id, count) in enumerate(stats['top_plans']):
+        plan_name = PLANS.get(plan_id, {}).get("name", plan_id)
+        top_plans_str += f"{idx+1}. {plan_name} — {count} продаж\n"
+
+    if not top_plans_str:
+        top_plans_str = "Нет данных"
+
+    text = (
+        f"🛠 **Админ-панель**\n\n"
+        f"👥 Всего пользователей: {stats['total_users']}\n"
+        f"✅ Активных подписок: {stats['active_subs']}\n"
+        f"❌ Истекших подписок: {stats['expired_subs']}\n"
+        f"🆓 Пробных периодов: {stats['trial_users']}\n\n"
+        f"💰 **Продажи**\n"
+        f"Сегодня: {stats['sales_today']} шт. ({stats['earnings_today']} руб)\n"
+        f"Неделя: {stats['sales_week']} шт. ({stats['earnings_week']} руб)\n"
+        f"Месяц: {stats['sales_month']} шт. ({stats['earnings_month']} руб)\n\n"
+        f"🏆 **Топ тарифов:**\n{top_plans_str}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список пользователей", callback_data="admin_users_list")],
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="admin_search_user")],
+        [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast")]
+    ])
+
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message, state: FSMContext):
+    admin_id_str = os.environ.get("ADMIN_ID", "")
+    if not admin_id_str.isdigit() or message.from_user.id != int(admin_id_str):
+        return
+    await state.clear()
+    await send_admin_panel(message)
+
+
+@dp.callback_query(F.data == "admin_users_list")
+async def admin_process_users_list(callback_query: types.CallbackQuery):
+    admin_id_str = os.environ.get("ADMIN_ID", "")
+    if not admin_id_str.isdigit() or callback_query.from_user.id != int(admin_id_str):
+        await callback_query.answer()
+        return
+
+    await callback_query.answer()
+    users = db.get_all_users()
+
+    file_content = "ID | Telegram ID | Username | Sub ID | Created | Expires | Blocked\n"
+    file_content += "-" * 80 + "\n"
+
+    for u in users:
+        blocked = "Yes" if u['is_blocked'] else "No"
+        username = f"@{u['username']}" if u['username'] else "None"
+        sub_id = u['sub_id'][:8] + "..." if u['sub_id'] else "None"
+        file_content += f"{u['id']} | {u['telegram_id']} | {username} | {sub_id} | {u['created_at']} | {u['expires_at']} | {blocked}\n"
+
+    from aiogram.types import BufferedInputFile
+    file = BufferedInputFile(file_content.encode("utf-8"), filename="users.txt")
+    await callback_query.message.answer_document(document=file)
+
+
+@dp.callback_query(F.data == "admin_search_user")
+async def admin_process_search_user(callback_query: types.CallbackQuery, state: FSMContext):
+    admin_id_str = os.environ.get("ADMIN_ID", "")
+    if not admin_id_str.isdigit() or callback_query.from_user.id != int(admin_id_str):
+        await callback_query.answer()
+        return
+
+    await callback_query.answer()
+    await state.set_state(AdminStates.waiting_for_user_query)
+    await callback_query.message.answer("Введите telegram_id или username пользователя (например, @username или 123456789):")
+
+@dp.message(AdminStates.waiting_for_user_query)
+async def admin_search_user_result(message: types.Message, state: FSMContext):
+    admin_id_str = os.environ.get("ADMIN_ID", "")
+    if not admin_id_str.isdigit() or message.from_user.id != int(admin_id_str):
+        return
+
+    query = message.text.strip()
+    user = db.search_user(query)
+
+    if not user:
+        await message.answer("Пользователь не найден.")
+    else:
+        status = "Заблокирован" if user['is_blocked'] else "Активен"
+        username = f"@{user['username']}" if user['username'] else "Нет"
+
+        text = (
+            f"👤 **Пользователь найден:**\n\n"
+            f"Telegram ID: `{user['telegram_id']}`\n"
+            f"Username: {username}\n"
+            f"Статус подписки (до): {user['expires_at'] or 'Нет данных'}\n"
+            f"Статус: **{status}**"
+        )
+
+        buttons = []
+        if user['is_blocked']:
+            buttons.append([InlineKeyboardButton(text="✅ Разблокировать", callback_data=f"admin_unblock_{user['telegram_id']}")])
+        else:
+            buttons.append([InlineKeyboardButton(text="🚫 Заблокировать", callback_data=f"admin_block_{user['telegram_id']}")])
+
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("admin_block_") | F.data.startswith("admin_unblock_"))
+async def admin_process_block_unblock(callback_query: types.CallbackQuery):
+    admin_id_str = os.environ.get("ADMIN_ID", "")
+    if not admin_id_str.isdigit() or callback_query.from_user.id != int(admin_id_str):
+        await callback_query.answer()
+        return
+
+    await callback_query.answer()
+    data = callback_query.data.split("_")
+    action = data[1]
+    target_id = int(data[2])
+
+    if action == "block":
+        db.set_user_blocked(target_id, 1)
+        await callback_query.message.answer(f"Пользователь {target_id} заблокирован.")
+    elif action == "unblock":
+        db.set_user_blocked(target_id, 0)
+        await callback_query.message.answer(f"Пользователь {target_id} разблокирован.")
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_process_broadcast(callback_query: types.CallbackQuery, state: FSMContext):
+    admin_id_str = os.environ.get("ADMIN_ID", "")
+    if not admin_id_str.isdigit() or callback_query.from_user.id != int(admin_id_str):
+        await callback_query.answer()
+        return
+
+    await callback_query.answer()
+    await state.set_state(AdminStates.waiting_for_broadcast_msg)
+    await callback_query.message.answer("Отправьте сообщение для рассылки всем пользователям:")
+
+
+@dp.message(AdminStates.waiting_for_broadcast_msg)
+async def admin_do_broadcast(message: types.Message, state: FSMContext):
+    admin_id_str = os.environ.get("ADMIN_ID", "")
+    if not admin_id_str.isdigit() or message.from_user.id != int(admin_id_str):
+        return
+
+    users = db.get_all_users()
+    success_count = 0
+    fail_count = 0
+
+    await message.answer("Рассылка начата...")
+
+    for u in users:
+        if u['is_blocked']:
+            continue
+        try:
+            await message.send_copy(chat_id=u['telegram_id'])
+            success_count += 1
+            await asyncio.sleep(0.05) # Rate limiting protection
+        except Exception as e:
+            logger.error(f"Failed to send broadcast to {u['telegram_id']}: {e}")
+            fail_count += 1
+
+    await message.answer(f"Рассылка завершена!\nУспешно: {success_count}\nОшибок: {fail_count}")
+    await state.clear()
