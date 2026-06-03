@@ -18,6 +18,10 @@ def init_db():
 
     # Update existing table with new columns if they don't exist
     try:
+        cursor.execute("ALTER TABLE users ADD COLUMN is_blocked BOOLEAN DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
         cursor.execute("ALTER TABLE users ADD COLUMN client_uuid TEXT")
     except sqlite3.OperationalError:
         pass # Column already exists
@@ -60,6 +64,17 @@ def init_db():
             rewarded BOOLEAN DEFAULT 0
         )
     ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            plan_id TEXT NOT NULL,
+            amount REAL NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -184,5 +199,107 @@ def update_username(telegram_id: int, username: str):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET username = ? WHERE telegram_id = ?", (username, telegram_id))
+    conn.commit()
+    conn.close()
+
+def record_sale(telegram_id: int, plan_id: str, amount: float):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    created_at = datetime.datetime.now()
+    cursor.execute(
+        "INSERT INTO sales (telegram_id, plan_id, amount, created_at) VALUES (?, ?, ?, ?)",
+        (telegram_id, plan_id, amount, created_at)
+    )
+    conn.commit()
+    conn.close()
+
+def get_stats():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    now = datetime.datetime.now()
+
+    # Total users
+    cursor.execute("SELECT COUNT(*) as count FROM users")
+    total_users = cursor.fetchone()['count']
+
+    # Active subscriptions
+    cursor.execute("SELECT COUNT(*) as count FROM users WHERE expires_at > ?", (now,))
+    active_subs = cursor.fetchone()['count']
+
+    # Expired subscriptions
+    cursor.execute("SELECT COUNT(*) as count FROM users WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,))
+    expired_subs = cursor.fetchone()['count']
+
+    # Trial users
+    cursor.execute("SELECT COUNT(*) as count FROM users WHERE trial_used = 1")
+    trial_users = cursor.fetchone()['count']
+
+    # Sales & Earnings for today, week, month
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_ago = today - datetime.timedelta(days=7)
+    month_ago = today - datetime.timedelta(days=30)
+
+    cursor.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total FROM sales WHERE created_at >= ?", (today,))
+    row = cursor.fetchone()
+    sales_today = row['count']
+    earnings_today = row['total']
+
+    cursor.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total FROM sales WHERE created_at >= ?", (week_ago,))
+    row = cursor.fetchone()
+    sales_week = row['count']
+    earnings_week = row['total']
+
+    cursor.execute("SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total FROM sales WHERE created_at >= ?", (month_ago,))
+    row = cursor.fetchone()
+    sales_month = row['count']
+    earnings_month = row['total']
+
+    # Top 3 plans
+    cursor.execute("SELECT plan_id, COUNT(*) as count FROM sales GROUP BY plan_id ORDER BY count DESC LIMIT 3")
+    top_plans = [(row['plan_id'], row['count']) for row in cursor.fetchall()]
+
+    conn.close()
+
+    return {
+        "total_users": total_users,
+        "active_subs": active_subs,
+        "expired_subs": expired_subs,
+        "trial_users": trial_users,
+        "sales_today": sales_today,
+        "earnings_today": earnings_today,
+        "sales_week": sales_week,
+        "earnings_week": earnings_week,
+        "sales_month": sales_month,
+        "earnings_month": earnings_month,
+        "top_plans": top_plans
+    }
+
+def get_all_users():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users")
+    users = cursor.fetchall()
+    conn.close()
+    return users
+
+def search_user(query: str):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if query.isdigit():
+        cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (int(query),))
+    else:
+        q = query.lstrip('@')
+        cursor.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE", (q,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def set_user_blocked(telegram_id: int, is_blocked: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET is_blocked = ? WHERE telegram_id = ?", (is_blocked, telegram_id))
     conn.commit()
     conn.close()
