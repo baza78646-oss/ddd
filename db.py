@@ -41,6 +41,43 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS promocodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            discount_type TEXT NOT NULL, -- 'percent' or 'rub'
+            discount_value REAL NOT NULL,
+            uses_left INTEGER NOT NULL,
+            expires_at TIMESTAMP
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS plans (
+            plan_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            days INTEGER NOT NULL,
+            price REAL NOT NULL
+        )
+    ''')
+
+    # Populate default plans if not exists
+    cursor.execute("SELECT COUNT(*) FROM plans")
+    if cursor.fetchone()[0] == 0:
+        default_plans = [
+            ("trial", "3 дня (Пробный)", 3, 0),
+            ("1m", "1 месяц", 30, 150),
+            ("3m", "3 месяца", 90, 400),
+            ("6m", "6 месяцев", 180, 700),
+            ("1y", "1 год", 365, 1200)
+        ]
+        cursor.executemany("INSERT INTO plans (plan_id, name, days, price) VALUES (?, ?, ?, ?)", default_plans)
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS pending_payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +92,27 @@ def init_db():
         cursor.execute("ALTER TABLE pending_payments ADD COLUMN target_telegram_id INTEGER")
     except sqlite3.OperationalError:
         pass
+
+    try:
+        cursor.execute("ALTER TABLE pending_payments ADD COLUMN plan_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE pending_payments ADD COLUMN amount REAL")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE pending_payments ADD COLUMN promo_code TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE pending_payments ADD COLUMN balance_used REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS referrals (
@@ -143,13 +201,13 @@ def get_expiring_users():
     conn.close()
     return users
 
-def create_pending_payment(payment_id: str, telegram_id: int, plan_duration_days: int, target_telegram_id: int = None):
+def create_pending_payment(payment_id: str, telegram_id: int, plan_duration_days: int, target_telegram_id: int = None, plan_id: str = None, amount: float = None, promo_code: str = None, balance_used: float = 0.0):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     created_at = datetime.datetime.now()
     cursor.execute(
-        "INSERT INTO pending_payments (payment_id, telegram_id, plan_duration_days, created_at, target_telegram_id) VALUES (?, ?, ?, ?, ?)",
-        (payment_id, telegram_id, plan_duration_days, created_at, target_telegram_id)
+        "INSERT INTO pending_payments (payment_id, telegram_id, plan_duration_days, created_at, target_telegram_id, plan_id, amount, promo_code, balance_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (payment_id, telegram_id, plan_duration_days, created_at, target_telegram_id, plan_id, amount, promo_code, balance_used)
     )
     conn.commit()
     conn.close()
@@ -303,3 +361,99 @@ def set_user_blocked(telegram_id: int, is_blocked: int):
     cursor.execute("UPDATE users SET is_blocked = ? WHERE telegram_id = ?", (is_blocked, telegram_id))
     conn.commit()
     conn.close()
+
+def update_balance(telegram_id: int, delta: float):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE telegram_id = ?", (delta, telegram_id))
+    conn.commit()
+    conn.close()
+
+def create_promocode(code: str, discount_type: str, discount_value: float, uses_left: int, expires_at: datetime.datetime = None):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO promocodes (code, discount_type, discount_value, uses_left, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (code, discount_type, discount_value, uses_left, expires_at)
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def get_promocode(code: str):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM promocodes WHERE code = ? COLLATE NOCASE", (code,))
+    promocode = cursor.fetchone()
+    conn.close()
+    return promocode
+
+def use_promocode(code: str):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE promocodes SET uses_left = uses_left - 1 WHERE code = ? COLLATE NOCASE", (code,))
+    conn.commit()
+    conn.close()
+
+def get_all_plans():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM plans")
+    plans = cursor.fetchall()
+    conn.close()
+
+    # Return as dict matching old format {plan_id: {"name": ..., "days": ..., "price": ...}}
+    result = {}
+    for p in plans:
+        result[p['plan_id']] = {
+            "name": p['name'],
+            "days": p['days'],
+            "price": p['price']
+        }
+    return result
+
+def get_plan(plan_id: str):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM plans WHERE plan_id = ?", (plan_id,))
+    plan = cursor.fetchone()
+    conn.close()
+    if plan:
+        return {
+            "name": plan['name'],
+            "days": plan['days'],
+            "price": plan['price']
+        }
+    return None
+
+def update_plan_price(plan_id: str, new_price: float):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE plans SET price = ? WHERE plan_id = ?", (new_price, plan_id))
+    conn.commit()
+    conn.close()
+
+def get_sales_graph_data():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    now = datetime.datetime.now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    data = []
+
+    # Get last 7 days
+    for i in range(7):
+        day = today - datetime.timedelta(days=i)
+        next_day = day + datetime.timedelta(days=1)
+        cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM sales WHERE created_at >= ? AND created_at < ?", (day, next_day))
+        total = cursor.fetchone()[0]
+        data.append({"date": day, "total": total})
+
+    conn.close()
+    return data
