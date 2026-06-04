@@ -4,3 +4,4 @@ __pycache__/
 *.log
 vpn.db
 .env
+venv/
