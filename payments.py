@@ -36,68 +36,57 @@ def check_yookassa_payment(payment_id: str):
     payment = Payment.find_one(payment_id)
     return payment.status == 'succeeded'
 
-def create_cryptomus_payment(amount: float, description: str, payload: str):
-    api_key = os.environ.get("CRYPTOMUS_API_KEY")
-    merchant_id = os.environ.get("CRYPTOMUS_MERCHANT_ID")
 
-    if not api_key or not merchant_id:
-        raise ValueError("Cryptomus credentials are not set")
+def create_cryptocloud_payment(amount: float, description: str, payload: str):
+    api_key = os.environ.get("CRYPTOCLOUD_API_KEY")
+    shop_id = os.environ.get("CRYPTOCLOUD_SHOP_ID")
 
-    order_id = str(uuid.uuid4())
+    if not api_key or not shop_id:
+        raise ValueError("CryptoCloud credentials are not set")
+
+    headers = {
+        'Authorization': f'Token {api_key}',
+        'Content-Type': 'application/json'
+    }
+
+    # We will pass the payload as order_id or in add_fields, order_id is a good choice to store our custom payload.
+    # We should ensure amount is passed as float and shop_id is passed.
     data = {
-        "amount": f"{amount:.2f}",
+        "amount": float(amount),
+        "shop_id": shop_id,
         "currency": "RUB",
-        "order_id": order_id,
-        "url_return": "https://t.me/",
-        "is_payment_multiple": False,
-        "lifetime": 3600
+        "order_id": payload
     }
 
-    json_data = json.dumps(data)
-    sign = base64.b64encode(json_data.encode('utf-8')).decode('utf-8')
-    import hashlib
-    sign = hashlib.md5(f"{sign}{api_key}".encode('utf-8')).hexdigest()
-
-    headers = {
-        'merchant': merchant_id,
-        'sign': sign,
-        'Content-Type': 'application/json'
-    }
-
-    response = requests.post("https://api.cryptomus.com/v1/payment", json=data, headers=headers)
+    response = requests.post("https://api.cryptocloud.plus/v2/invoice/create", json=data, headers=headers)
     response.raise_for_status()
     res_json = response.json()
 
-    if res_json.get("state") == 0:
+    if res_json.get("status") == "success":
         result = res_json.get("result", {})
-        return result.get("url"), result.get("uuid")
+        return result.get("link"), result.get("uuid")
     else:
-        raise Exception(f"Cryptomus error: {res_json}")
+        raise Exception(f"CryptoCloud error: {res_json}")
 
-def check_cryptomus_payment(order_uuid: str):
-    api_key = os.environ.get("CRYPTOMUS_API_KEY")
-    merchant_id = os.environ.get("CRYPTOMUS_MERCHANT_ID")
+def check_cryptocloud_payment(invoice_uuid: str):
+    api_key = os.environ.get("CRYPTOCLOUD_API_KEY")
+
+    headers = {
+        'Authorization': f'Token {api_key}',
+        'Content-Type': 'application/json'
+    }
 
     data = {
-        "uuid": order_uuid
+        "uuids": [invoice_uuid]
     }
 
-    json_data = json.dumps(data)
-    sign = base64.b64encode(json_data.encode('utf-8')).decode('utf-8')
-    import hashlib
-    sign = hashlib.md5(f"{sign}{api_key}".encode('utf-8')).hexdigest()
-
-    headers = {
-        'merchant': merchant_id,
-        'sign': sign,
-        'Content-Type': 'application/json'
-    }
-
-    response = requests.post("https://api.cryptomus.com/v1/payment/info", json=data, headers=headers)
+    response = requests.post("https://api.cryptocloud.plus/v2/invoice/merchant/info", json=data, headers=headers)
     response.raise_for_status()
     res_json = response.json()
 
-    if res_json.get("state") == 0:
-        status = res_json.get("result", {}).get("status")
-        return status in ["paid", "paid_over"]
+    if res_json.get("status") == "success":
+        results = res_json.get("result", [])
+        if results:
+            status = results[0].get("status")
+            return status in ["paid", "overpaid"]
     return False

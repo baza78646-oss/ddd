@@ -11,7 +11,9 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 
 import db
 from xui_api import XUIClient
-from payments import create_yookassa_payment, check_yookassa_payment, create_cryptomus_payment, check_cryptomus_payment
+from payments import create_yookassa_payment, check_yookassa_payment, create_cryptocloud_payment, check_cryptocloud_payment
+from aiogram.types import LabeledPrice, PreCheckoutQuery
+import uuid
 
 class GiftSub(StatesGroup):
     waiting_for_username = State()
@@ -304,7 +306,8 @@ async def process_gift_plan_selection(callback_query: types.CallbackQuery, state
     plan = db.get_plan(plan_id)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Оплатить криптой (Cryptomus)", callback_data=f"giftpay_cryptomus_{plan_id}")],
+        [InlineKeyboardButton(text="Оплатить ⭐️ Telegram Stars", callback_data=f"giftpay_stars_{plan_id}")],
+        [InlineKeyboardButton(text="Оплатить криптой (CryptoCloud)", callback_data=f"giftpay_cryptocloud_{plan_id}")],
         [InlineKeyboardButton(text="Оплатить картой (ЮКасса)", callback_data=f"giftpay_yookassa_{plan_id}")]
     ])
     await callback_query.message.answer(
@@ -381,7 +384,8 @@ async def render_checkout(message_or_callback: types.Message | types.CallbackQue
         buttons.append([InlineKeyboardButton(text=f"💵 Использовать баланс ({user['balance']:.2f} руб.)", callback_data="checkout_use_balance")])
 
     if final_price > 0:
-        buttons.append([InlineKeyboardButton(text="Оплатить криптой (Cryptomus)", callback_data=f"pay_cryptomus_{plan_id}")])
+        buttons.append([InlineKeyboardButton(text="Оплатить ⭐️ Telegram Stars", callback_data=f"pay_stars_{plan_id}")],
+        [InlineKeyboardButton(text="Оплатить криптой (CryptoCloud)", callback_data=f"pay_cryptocloud_{plan_id}")])
         buttons.append([InlineKeyboardButton(text="Оплатить картой (ЮКасса)", callback_data=f"pay_yookassa_{plan_id}")])
     else:
         buttons.append([InlineKeyboardButton(text="✅ Оплатить балансом", callback_data=f"pay_balance_{plan_id}")])
@@ -468,18 +472,79 @@ async def process_payment_method(callback_query: types.CallbackQuery, state: FSM
             ])
             await callback_query.message.answer("Ссылка для оплаты сгенерирована:", reply_markup=kb)
 
-        elif method == "cryptomus":
-            url, payment_id = create_cryptomus_payment(amount, description, f"user_{callback_query.from_user.id}_{plan_id}")
+        elif method == "cryptocloud":
+            url, payment_id = create_cryptocloud_payment(amount, description, f"user_{callback_query.from_user.id}_{plan_id}")
             db.create_pending_payment(payment_id, callback_query.from_user.id, plan['days'], target_telegram_id, plan_id, amount, promo_code, balance_used)
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Оплатить", url=url)],
-                [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check_cryptomus_{payment_id}")]
+                [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check_cryptocloud_{payment_id}")]
             ])
             await callback_query.message.answer("Ссылка для оплаты сгенерирована:", reply_markup=kb)
+
+        elif method == "stars":
+            payment_id = str(uuid.uuid4())
+            stars_amount = int(amount)
+            db.create_pending_payment(payment_id, callback_query.from_user.id, plan['days'], target_telegram_id, plan_id, amount, promo_code, balance_used)
+            prices = [LabeledPrice(label=plan['name'], amount=stars_amount)]
+            await bot.send_invoice(
+                chat_id=callback_query.message.chat.id,
+                title=f"Подписка {plan['name']}",
+                description=description,
+                payload=f"stars_{payment_id}",
+                provider_token="",
+                currency="XTR",
+                prices=prices
+            )
 
     except Exception as e:
         logger.error(f"Payment generation error: {e}")
         await callback_query.message.answer("Произошла ошибка при генерации ссылки на оплату. Попробуйте позже.")
+
+
+@dp.pre_checkout_query()
+async def pre_checkout_query_handler(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: types.Message):
+    payload = message.successful_payment.invoice_payload
+    if payload.startswith("stars_"):
+        payment_id = payload.split("stars_")[1]
+        pending = db.get_pending_payment(payment_id)
+        if not pending:
+            return
+
+        target_id = pending['target_telegram_id'] if pending['target_telegram_id'] is not None else pending['telegram_id']
+
+        balance_used = pending['balance_used'] if 'balance_used' in pending.keys() else 0.0
+        if balance_used > 0:
+            db.update_balance(pending['telegram_id'], -balance_used)
+
+        promo_code = pending['promo_code'] if 'promo_code' in pending.keys() else None
+        if promo_code:
+            db.use_promocode(promo_code)
+
+        amount = pending['amount'] if 'amount' in pending.keys() else 0.0
+        plan_id = pending['plan_id'] if 'plan_id' in pending.keys() else None
+
+        if plan_id:
+            db.record_sale(pending['telegram_id'], plan_id, amount)
+        else:
+            plans = db.get_all_plans()
+            for p_id, plan_data in plans.items():
+                if plan_data['days'] == pending['plan_duration_days']:
+                    db.record_sale(pending['telegram_id'], p_id, plan_data['price'])
+                    break
+
+        await process_successful_subscription(message, target_id, pending['plan_duration_days'])
+
+        if pending['target_telegram_id'] is not None:
+            try:
+                await bot.send_message(target_id, "Вам подарили подписку!")
+            except Exception as e:
+                import logging
+                logging.error(f"Failed to notify gift recipient: {e}")
+        db.delete_pending_payment(payment_id)
 
 @dp.callback_query(F.data.startswith("check_"))
 async def process_check_payment(callback_query: types.CallbackQuery):
@@ -497,8 +562,8 @@ async def process_check_payment(callback_query: types.CallbackQuery):
         is_paid = False
         if method == "yookassa":
             is_paid = check_yookassa_payment(payment_id)
-        elif method == "cryptomus":
-            is_paid = check_cryptomus_payment(payment_id)
+        elif method == "cryptocloud":
+            is_paid = check_cryptocloud_payment(payment_id)
 
         if is_paid:
             target_id = pending['target_telegram_id'] if pending['target_telegram_id'] is not None else pending['telegram_id']
