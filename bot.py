@@ -384,8 +384,8 @@ async def render_checkout(message_or_callback: types.Message | types.CallbackQue
         buttons.append([InlineKeyboardButton(text=f"💵 Использовать баланс ({user['balance']:.2f} руб.)", callback_data="checkout_use_balance")])
 
     if final_price > 0:
-        buttons.append([InlineKeyboardButton(text="Оплатить ⭐️ Telegram Stars", callback_data=f"pay_stars_{plan_id}")],
-        [InlineKeyboardButton(text="Оплатить криптой (CryptoCloud)", callback_data=f"pay_cryptocloud_{plan_id}")])
+        buttons.append([InlineKeyboardButton(text="Оплатить ⭐️ Telegram Stars", callback_data=f"pay_stars_{plan_id}")])
+        buttons.append([InlineKeyboardButton(text="Оплатить криптой (CryptoCloud)", callback_data=f"pay_cryptocloud_{plan_id}")])
         buttons.append([InlineKeyboardButton(text="Оплатить картой (ЮКасса)", callback_data=f"pay_yookassa_{plan_id}")])
     else:
         buttons.append([InlineKeyboardButton(text="✅ Оплатить балансом", callback_data=f"pay_balance_{plan_id}")])
